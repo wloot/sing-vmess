@@ -13,6 +13,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -45,6 +46,7 @@ var (
 type Service[U comparable] struct {
 	userKey              map[U][16]byte
 	userIdCipher         map[U]cipher.Block
+	recentUsers          sync.Map // map[U]*int64 (user -> lastAccessPtr)
 	replayFilter         replay.Filter
 	handler              Handler
 	time                 func() time.Time
@@ -198,22 +200,58 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 	var decodedId [16]byte
 	var user U
 	var found bool
-	for currUser, userIdBlock := range s.userIdCipher {
+
+	var timestamp int64
+	now := time.Now().Unix()
+
+	// Hot path: try recently active users first
+	s.recentUsers.Range(func(key, value any) bool {
+		cachedUser, _ := key.(U)
+		userIdBlock, exists := s.userIdCipher[cachedUser]
+		if !exists {
+			s.recentUsers.Delete(cachedUser)
+			return true
+		}
+		lastAccessPtr, _ := value.(*int64)
 		userIdBlock.Decrypt(decodedId[:], authId)
-		timestamp := int64(binary.BigEndian.Uint64(decodedId[:]))
+		timestamp = int64(binary.BigEndian.Uint64(decodedId[:]))
 		checksum := binary.BigEndian.Uint32(decodedId[12:])
 		if crc32.ChecksumIEEE(decodedId[:12]) != checksum {
-			continue
+			if now-*lastAccessPtr > 600 {
+				s.recentUsers.Delete(cachedUser)
+			}
+			return true
 		}
+		user = cachedUser
+		found = true
+		*lastAccessPtr = now
+		return false
+	})
+
+	// Cold path: iterate through all users if not found in cache
+	if !found {
+		for currUser, userIdBlock := range s.userIdCipher {
+			userIdBlock.Decrypt(decodedId[:], authId)
+			timestamp = int64(binary.BigEndian.Uint64(decodedId[:]))
+			checksum := binary.BigEndian.Uint32(decodedId[12:])
+			if crc32.ChecksumIEEE(decodedId[:12]) != checksum {
+				continue
+			}
+			user = currUser
+			found = true
+			// Add to recent users cache
+			s.recentUsers.Store(currUser, &now)
+			break
+		}
+	}
+
+	if found {
 		if math.Abs(math.Abs(float64(timestamp))-float64(time.Now().Unix())) > 120 {
 			return ErrBadTimestamp
 		}
 		if !s.replayFilter.Check(decodedId[:]) {
 			return ErrReplay
 		}
-		user = currUser
-		found = true
-		break
 	}
 
 	var legacyProtocol bool

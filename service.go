@@ -202,7 +202,7 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 	var found bool
 
 	var timestamp int64
-	now := time.Now().Unix()
+	now := s.time().Unix()
 
 	// Hot path: try recently active users first
 	s.recentUsers.Range(func(key, value any) bool {
@@ -246,7 +246,7 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 	}
 
 	if found {
-		if math.Abs(math.Abs(float64(timestamp))-float64(time.Now().Unix())) > 120 {
+		if math.Abs(math.Abs(float64(timestamp))-float64(now)) > 120 {
 			return ErrBadTimestamp
 		}
 		if !s.replayFilter.Check(decodedId[:]) {

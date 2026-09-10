@@ -96,6 +96,7 @@ func (r *AEADChunkReader) Upstream() any {
 
 type AEADChunkWriter struct {
 	upstream      N.ExtendedWriter
+	vectorised    N.VectorisedWriter
 	cipher        cipher.AEAD
 	globalPadding sha3.ShakeHash
 	nonce         []byte
@@ -109,6 +110,7 @@ func NewAEADChunkWriter(upstream io.Writer, cipher cipher.AEAD, nonce []byte, gl
 	copy(writeNonce, nonce)
 	return &AEADChunkWriter{
 		upstream:      bufio.NewExtendedWriter(upstream),
+		vectorised:    bufio.NewVectorisedWriter(upstream),
 		cipher:        cipher,
 		nonce:         writeNonce,
 		globalPadding: globalPadding,
@@ -174,6 +176,39 @@ func (w *AEADChunkWriter) WriteBuffer(buffer *buf.Buffer) error {
 		buffer.Release()
 		return nil
 	}
+	err := w.frame(buffer)
+	if err != nil {
+		buffer.Release()
+		return err
+	}
+	return w.upstream.WriteBuffer(buffer)
+}
+
+// WriteVectorised frames every buffer in place and hands the batch down in
+// one call. Empty buffers are dropped: a zero-length chunk ends the stream.
+func (w *AEADChunkWriter) WriteVectorised(buffers []*buf.Buffer) error {
+	chunks := buffers[:0]
+	for _, buffer := range buffers {
+		if buffer.IsEmpty() {
+			buffer.Release()
+			continue
+		}
+		err := w.frame(buffer)
+		if err != nil {
+			buf.ReleaseMulti(buffers)
+			return err
+		}
+		chunks = append(chunks, buffer)
+	}
+	if len(chunks) == 0 {
+		return nil
+	}
+	return w.vectorised.WriteVectorised(chunks)
+}
+
+// frame prepends the sealed length and appends the padding of one chunk in
+// place, using the buffer's headroom. The buffer must not be empty.
+func (w *AEADChunkWriter) frame(buffer *buf.Buffer) error {
 	dataLength := uint16(buffer.Len())
 	var paddingLen uint16
 	if w.globalPadding != nil {
@@ -193,11 +228,10 @@ func (w *AEADChunkWriter) WriteBuffer(buffer *buf.Buffer) error {
 	if paddingLen > 0 {
 		_, err := buffer.ReadFullFrom(rand.Reader, int(paddingLen))
 		if err != nil {
-			buffer.Release()
 			return err
 		}
 	}
-	return w.upstream.WriteBuffer(buffer)
+	return nil
 }
 
 func (w *AEADChunkWriter) FrontHeadroom() int {

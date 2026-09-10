@@ -81,6 +81,7 @@ func (r *StreamChunkReader) Upstream() any {
 
 type StreamChunkWriter struct {
 	upstream      N.ExtendedWriter
+	vectorised    N.VectorisedWriter
 	chunkMasking  sha3.ShakeHash
 	globalPadding sha3.ShakeHash
 	hashAccess    sync.Mutex
@@ -90,6 +91,7 @@ type StreamChunkWriter struct {
 func NewStreamChunkWriter(upstream io.Writer, chunkMasking sha3.ShakeHash, globalPadding sha3.ShakeHash) *StreamChunkWriter {
 	return &StreamChunkWriter{
 		upstream:      bufio.NewExtendedWriter(upstream),
+		vectorised:    bufio.NewVectorisedWriter(upstream),
 		chunkMasking:  chunkMasking,
 		globalPadding: globalPadding,
 	}
@@ -140,6 +142,39 @@ func (w *StreamChunkWriter) WriteBuffer(buffer *buf.Buffer) error {
 		buffer.Release()
 		return nil
 	}
+	err := w.frame(buffer)
+	if err != nil {
+		buffer.Release()
+		return err
+	}
+	return w.upstream.WriteBuffer(buffer)
+}
+
+// WriteVectorised frames every buffer in place and hands the batch down in
+// one call. Empty buffers are dropped: a zero-length chunk ends the stream.
+func (w *StreamChunkWriter) WriteVectorised(buffers []*buf.Buffer) error {
+	chunks := buffers[:0]
+	for _, buffer := range buffers {
+		if buffer.IsEmpty() {
+			buffer.Release()
+			continue
+		}
+		err := w.frame(buffer)
+		if err != nil {
+			buf.ReleaseMulti(buffers)
+			return err
+		}
+		chunks = append(chunks, buffer)
+	}
+	if len(chunks) == 0 {
+		return nil
+	}
+	return w.vectorised.WriteVectorised(chunks)
+}
+
+// frame prepends the (masked) length and appends the padding of one chunk in
+// place, using the buffer's headroom. The buffer must not be empty.
+func (w *StreamChunkWriter) frame(buffer *buf.Buffer) error {
 	dataLen := uint16(buffer.Len())
 	var paddingLen uint16
 	if w.globalPadding != nil || w.chunkMasking != nil {
@@ -161,11 +196,10 @@ func (w *StreamChunkWriter) WriteBuffer(buffer *buf.Buffer) error {
 	if paddingLen > 0 {
 		_, err := buffer.ReadFullFrom(rand.Reader, int(paddingLen))
 		if err != nil {
-			buffer.Release()
 			return err
 		}
 	}
-	return w.upstream.WriteBuffer(buffer)
+	return nil
 }
 
 func (w *StreamChunkWriter) WriteWithChecksum(checksum uint32, p []byte) (n int, err error) {

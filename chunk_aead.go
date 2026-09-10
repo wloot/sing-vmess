@@ -71,6 +71,7 @@ func (r *AEADReader) Upstream() any {
 
 type AEADWriter struct {
 	upstream   N.ExtendedWriter
+	vectorised N.VectorisedWriter
 	cipher     cipher.AEAD
 	nonce      []byte
 	nonceCount uint16
@@ -80,9 +81,10 @@ func NewAEADWriter(upstream io.Writer, cipher cipher.AEAD, nonce []byte) *AEADWr
 	writeNonce := make([]byte, cipher.NonceSize())
 	copy(writeNonce, nonce)
 	return &AEADWriter{
-		upstream: bufio.NewExtendedWriter(upstream),
-		cipher:   cipher,
-		nonce:    writeNonce,
+		upstream:   bufio.NewExtendedWriter(upstream),
+		vectorised: bufio.NewVectorisedWriter(upstream),
+		cipher:     cipher,
+		nonce:      writeNonce,
 	}
 }
 
@@ -113,11 +115,26 @@ func (w *AEADWriter) Write(p []byte) (n int, err error) {
 }
 
 func (w *AEADWriter) WriteBuffer(buffer *buf.Buffer) error {
+	w.seal(buffer)
+	return w.upstream.WriteBuffer(buffer)
+}
+
+// WriteVectorised seals every buffer in place and hands the whole batch down
+// in one call, so a burst of chunks reaches the socket as a single writev
+// instead of one write per chunk.
+func (w *AEADWriter) WriteVectorised(buffers []*buf.Buffer) error {
+	for _, buffer := range buffers {
+		w.seal(buffer)
+	}
+	return w.vectorised.WriteVectorised(buffers)
+}
+
+// seal encrypts the buffer in place; the tag goes into its rear headroom.
+func (w *AEADWriter) seal(buffer *buf.Buffer) {
 	binary.BigEndian.PutUint16(w.nonce, w.nonceCount)
 	w.nonceCount += 1
 	w.cipher.Seal(buffer.Index(0), w.nonce, buffer.Bytes(), nil)
 	buffer.Extend(CipherOverhead)
-	return w.upstream.WriteBuffer(buffer)
 }
 
 func (w *AEADWriter) RearHeadroom() int {

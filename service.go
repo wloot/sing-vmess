@@ -500,6 +500,7 @@ type rawServerConn struct {
 	option         byte
 	reader         N.ExtendedReader
 	writer         N.ExtendedWriter
+	vectorised     N.VectorisedWriter // the chunk framing layer of writer, nil for the legacy stream
 }
 
 func (c *rawServerConn) writeResponse() error {
@@ -545,9 +546,96 @@ func (c *rawServerConn) writeResponse() error {
 			return err
 		}
 
-		c.writer = bufio.NewExtendedWriter(CreateWriter(c.Conn, nil, c.requestKey, c.requestNonce, responseKey, responseNonce, c.security, c.option))
+		writer := CreateWriter(c.Conn, nil, c.requestKey, c.requestNonce, responseKey, responseNonce, c.security, c.option)
+		c.writer = bufio.NewExtendedWriter(writer)
+		c.vectorised = vectorisedChunkWriter(writer)
 	}
 	return nil
+}
+
+// chunked reports whether the response is a chunk stream whose framing can be
+// applied in place, which is what the vectorised path relies on.
+func (c *rawServerConn) chunked() bool {
+	if c.legacyProtocol || c.option&RequestOptionChunkStream == 0 {
+		return false
+	}
+	switch c.security {
+	case SecurityTypeAes128Gcm, SecurityTypeChacha20Poly1305, SecurityTypeNone:
+		return true
+	}
+	return false
+}
+
+// vectorisedChunkWriter finds the framing layer of a CreateWriter chain that
+// can take a batch of chunks; nil when the chain has none (legacy stream).
+func vectorisedChunkWriter(writer io.Writer) N.VectorisedWriter {
+	for {
+		switch w := writer.(type) {
+		case *AEADWriter, *StreamChunkWriter, *AEADChunkWriter:
+			return w.(N.VectorisedWriter)
+		case *bufio.ChunkWriter:
+			writer = w.Upstream().(io.Writer)
+		case *bufio.ExtendedWriterWrapper:
+			writer = w.Writer
+		default:
+			return nil
+		}
+	}
+}
+
+// splitChunks makes every buffer of a batch fit one chunk with the headroom
+// the framing needs. Buffers that already do pass through untouched, which is
+// the case for everything the relay reads once it knows WriterMTU. A larger
+// buffer keeps its first chunk in place and copies the rest out before the
+// first chunk is sealed, because the tag lands on the bytes that follow it.
+func splitChunks(buffers []*buf.Buffer) []*buf.Buffer {
+	fits := func(buffer *buf.Buffer) bool {
+		return buffer.Len() <= WriteChunkSize && buffer.Start() >= MaxFrontHeadroom && buffer.FreeLen() >= MaxRearHeadroom
+	}
+	needWork := false
+	for _, buffer := range buffers {
+		if buffer.IsEmpty() || !fits(buffer) {
+			needWork = true
+			break
+		}
+	}
+	if !needWork {
+		return buffers
+	}
+	chunks := make([]*buf.Buffer, 0, len(buffers)+4)
+	for _, buffer := range buffers {
+		if buffer.IsEmpty() {
+			buffer.Release()
+			continue
+		}
+		if fits(buffer) {
+			chunks = append(chunks, buffer)
+			continue
+		}
+		data := buffer.Bytes()
+		keepHead := buffer.Start() >= MaxFrontHeadroom && buffer.FreeLen() >= MaxRearHeadroom
+		if keepHead {
+			// Only too long: the head stays where it is.
+			buffer.Truncate(WriteChunkSize)
+			chunks = append(chunks, buffer)
+			data = data[WriteChunkSize:]
+		}
+		for len(data) > 0 {
+			pieceLen := len(data)
+			if pieceLen > WriteChunkSize {
+				pieceLen = WriteChunkSize
+			}
+			piece := buf.NewSize(MaxFrontHeadroom + pieceLen + MaxRearHeadroom)
+			piece.Resize(MaxFrontHeadroom, 0)
+			common.Must1(piece.Write(data[:pieceLen]))
+			chunks = append(chunks, piece)
+			data = data[pieceLen:]
+		}
+		if !keepHead {
+			buffer.Release()
+		}
+	}
+	return chunks
 }
 
 func (c *rawServerConn) Close() error {
@@ -612,6 +700,49 @@ func (c *serverConn) WriteBuffer(buffer *buf.Buffer) error {
 		}
 	}
 	return c.writer.WriteBuffer(buffer)
+}
+
+var (
+	_ N.WriterWithMTU          = (*serverConn)(nil)
+	_ N.VectorisedWriteCreator = (*serverConn)(nil)
+	_ N.VectorisedWriter       = (*serverConn)(nil)
+)
+
+// WriterMTU tells the relay how much fits in one chunk, so it reads from the
+// peer in chunk-sized pieces that are framed in place instead of being split
+// and copied here.
+func (c *serverConn) WriterMTU() int {
+	if !c.chunked() {
+		return 0
+	}
+	return WriteChunkSize
+}
+
+// CreateVectorisedWriter lets the relay hand over a batch of chunks at a time
+// once a connection carries enough data; see WriteVectorised.
+func (c *serverConn) CreateVectorisedWriter() (N.VectorisedWriter, bool) {
+	if !c.chunked() {
+		return nil, false
+	}
+	return c, true
+}
+
+// WriteVectorised writes a batch of chunks with one call down the stack: the
+// response header first if it has not gone out yet, then every buffer framed
+// and sealed in place and sent with a single writev.
+func (c *serverConn) WriteVectorised(buffers []*buf.Buffer) error {
+	if c.writer == nil {
+		err := c.writeResponse()
+		if err != nil {
+			buf.ReleaseMulti(buffers)
+			return err
+		}
+	}
+	if c.vectorised == nil {
+		buf.ReleaseMulti(buffers)
+		return E.New("vmess: vectorised write on a stream without chunk framing")
+	}
+	return c.vectorised.WriteVectorised(splitChunks(buffers))
 }
 
 func (c *serverConn) WriteTo(w io.Writer) (n int64, err error) {

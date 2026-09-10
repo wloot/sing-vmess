@@ -81,10 +81,9 @@ func NewAEADWriter(upstream io.Writer, cipher cipher.AEAD, nonce []byte) *AEADWr
 	writeNonce := make([]byte, cipher.NonceSize())
 	copy(writeNonce, nonce)
 	return &AEADWriter{
-		upstream:   bufio.NewExtendedWriter(upstream),
-		vectorised: bufio.NewVectorisedWriter(upstream),
-		cipher:     cipher,
-		nonce:      writeNonce,
+		upstream: bufio.NewExtendedWriter(upstream),
+		cipher:   cipher,
+		nonce:    writeNonce,
 	}
 }
 
@@ -119,10 +118,30 @@ func (w *AEADWriter) WriteBuffer(buffer *buf.Buffer) error {
 	return w.upstream.WriteBuffer(buffer)
 }
 
+// CreateVectorisedWriter reports whether a batch handed to this writer reaches
+// the socket as one writev, and prepares the way down if so. Connections that
+// never write in batches allocate nothing for it.
+func (w *AEADWriter) CreateVectorisedWriter() (N.VectorisedWriter, bool) {
+	if w.vectorised == nil {
+		vectorised, created := bufio.CreateVectorisedWriter(w.upstream)
+		if !created {
+			return nil, false
+		}
+		w.vectorised = vectorised
+	}
+	return w, true
+}
+
 // WriteVectorised seals every buffer in place and hands the whole batch down
 // in one call, so a burst of chunks reaches the socket as a single writev
-// instead of one write per chunk.
+// instead of one write per chunk. Without a socket underneath it is one write
+// per buffer, which is what the batch would have cost anyway.
 func (w *AEADWriter) WriteVectorised(buffers []*buf.Buffer) error {
+	if w.vectorised == nil {
+		if _, created := w.CreateVectorisedWriter(); !created {
+			return writeBuffers(w, buffers)
+		}
+	}
 	for _, buffer := range buffers {
 		w.seal(buffer)
 	}

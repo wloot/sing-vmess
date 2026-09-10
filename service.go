@@ -500,7 +500,7 @@ type rawServerConn struct {
 	option         byte
 	reader         N.ExtendedReader
 	writer         N.ExtendedWriter
-	vectorised     N.VectorisedWriter // the chunk framing layer of writer, nil for the legacy stream
+	vectorised     chunkFramer // the chunk framing layer of writer, nil for the legacy stream
 }
 
 func (c *rawServerConn) writeResponse() error {
@@ -566,13 +566,33 @@ func (c *rawServerConn) chunked() bool {
 	return false
 }
 
-// vectorisedChunkWriter finds the framing layer of a CreateWriter chain that
-// can take a batch of chunks; nil when the chain has none (legacy stream).
-func vectorisedChunkWriter(writer io.Writer) N.VectorisedWriter {
+// chunkFramer is the layer of a CreateWriter chain that frames chunks in
+// place and can hand a batch of them down as one writev.
+type chunkFramer interface {
+	N.VectorisedWriter
+	N.VectorisedWriteCreator
+}
+
+// writeBuffers writes a batch one buffer at a time, for a writer whose way
+// down to the socket cannot take a batch.
+func writeBuffers(writer N.ExtendedWriter, buffers []*buf.Buffer) error {
+	for index, buffer := range buffers {
+		err := writer.WriteBuffer(buffer)
+		if err != nil {
+			buf.ReleaseMulti(buffers[index+1:])
+			return err
+		}
+	}
+	return nil
+}
+
+// vectorisedChunkWriter finds the framing layer of a CreateWriter chain;
+// nil when the chain has none (legacy stream).
+func vectorisedChunkWriter(writer io.Writer) chunkFramer {
 	for {
 		switch w := writer.(type) {
 		case *AEADWriter, *StreamChunkWriter, *AEADChunkWriter:
-			return w.(N.VectorisedWriter)
+			return w.(chunkFramer)
 		case *bufio.ChunkWriter:
 			writer = w.Upstream().(io.Writer)
 		case *bufio.ExtendedWriterWrapper:
@@ -719,9 +739,23 @@ func (c *serverConn) WriterMTU() int {
 }
 
 // CreateVectorisedWriter lets the relay hand over a batch of chunks at a time
-// once a connection carries enough data; see WriteVectorised.
+// once a connection carries enough data; see WriteVectorised. It says no when
+// the framing cannot be applied in place, and also when nothing underneath
+// takes a writev, so the relay keeps its single-buffer path rather than
+// batching into a copy.
 func (c *serverConn) CreateVectorisedWriter() (N.VectorisedWriter, bool) {
 	if !c.chunked() {
+		return nil, false
+	}
+	if c.writer == nil {
+		// No chain to ask before the response has gone out; the answer only
+		// depends on the connection the chain gets built on.
+		if _, created := bufio.CreateVectorisedWriter(c.Conn); !created {
+			return nil, false
+		}
+		return c, true
+	}
+	if _, created := c.vectorised.CreateVectorisedWriter(); !created {
 		return nil, false
 	}
 	return c, true
@@ -739,8 +773,7 @@ func (c *serverConn) WriteVectorised(buffers []*buf.Buffer) error {
 		}
 	}
 	if c.vectorised == nil {
-		buf.ReleaseMulti(buffers)
-		return E.New("vmess: vectorised write on a stream without chunk framing")
+		return writeBuffers(c.writer, buffers)
 	}
 	return c.vectorised.WriteVectorised(splitChunks(buffers))
 }

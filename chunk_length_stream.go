@@ -91,7 +91,6 @@ type StreamChunkWriter struct {
 func NewStreamChunkWriter(upstream io.Writer, chunkMasking sha3.ShakeHash, globalPadding sha3.ShakeHash) *StreamChunkWriter {
 	return &StreamChunkWriter{
 		upstream:      bufio.NewExtendedWriter(upstream),
-		vectorised:    bufio.NewVectorisedWriter(upstream),
 		chunkMasking:  chunkMasking,
 		globalPadding: globalPadding,
 	}
@@ -150,9 +149,29 @@ func (w *StreamChunkWriter) WriteBuffer(buffer *buf.Buffer) error {
 	return w.upstream.WriteBuffer(buffer)
 }
 
+// CreateVectorisedWriter reports whether a batch handed to this writer reaches
+// the socket as one writev, and prepares the way down if so. Connections that
+// never write in batches allocate nothing for it.
+func (w *StreamChunkWriter) CreateVectorisedWriter() (N.VectorisedWriter, bool) {
+	if w.vectorised == nil {
+		vectorised, created := bufio.CreateVectorisedWriter(w.upstream)
+		if !created {
+			return nil, false
+		}
+		w.vectorised = vectorised
+	}
+	return w, true
+}
+
 // WriteVectorised frames every buffer in place and hands the batch down in
 // one call. Empty buffers are dropped: a zero-length chunk ends the stream.
+// Without a socket underneath it is one write per buffer.
 func (w *StreamChunkWriter) WriteVectorised(buffers []*buf.Buffer) error {
+	if w.vectorised == nil {
+		if _, created := w.CreateVectorisedWriter(); !created {
+			return writeBuffers(w, buffers)
+		}
+	}
 	chunks := buffers[:0]
 	for _, buffer := range buffers {
 		if buffer.IsEmpty() {

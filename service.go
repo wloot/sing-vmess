@@ -13,7 +13,7 @@ import (
 	"io"
 	"math"
 	"net"
-	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -44,9 +44,7 @@ var (
 )
 
 type Service[U comparable] struct {
-	userKey              map[U][16]byte
-	userIdCipher         map[U]cipher.Block
-	recentUsers          sync.Map // map[U]*int64 (user -> lastAccessPtr)
+	users                atomic.Pointer[userTable[U]] // immutable snapshot, see publishUsers
 	replayFilter         replay.Filter
 	handler              Handler
 	time                 func() time.Time
@@ -58,11 +56,41 @@ type Service[U comparable] struct {
 	alterIdUpdateDone    chan struct{}
 }
 
+// userTable is the immutable snapshot NewConnection authenticates against. It
+// is replaced wholesale and nothing here takes a lock: UpdateUsers publishes
+// new credentials and promoteUser swaps in a snapshot with one more hot user.
+type userTable[U comparable] struct {
+	key      map[U][16]byte
+	idCipher map[U]cipher.Block
+	// hot holds the users that authenticated within authHotIdleSeconds and is
+	// probed first. lastAccess is the only mutable field; it is updated
+	// atomically in place, everything else is copied into the next snapshot.
+	hot []authEntry[U]
+	// cold holds every user, contiguous, and is only built by publishUsers, so
+	// promoting a user costs a copy of hot and nothing proportional to the
+	// user count. A miss on hot costs one sequential pass over it.
+	cold []authEntry[U]
+}
+
+type authEntry[U comparable] struct {
+	// lastAccess comes first so it stays 64-bit aligned for the atomic ops on
+	// 32-bit targets; unix seconds, hot entries only.
+	lastAccess int64
+	user       U
+	cipher     cipher.Block
+}
+
 type legacyUserEntry[U comparable] struct {
 	User  U
 	Time  int64
 	Index int
 }
+
+// authHotIdleSeconds demotes a hot user that has not authenticated for this
+// long, which is what bounds the hot slice: it never holds more than the users
+// active in one such window. Demotion runs when a snapshot is rebuilt, not on
+// the read path.
+const authHotIdleSeconds = 600
 
 func NewService[U comparable](handler Handler, options ...ServiceOption) *Service[U] {
 	service := &Service[U]{
@@ -105,8 +133,7 @@ func (s *Service[U]) UpdateUsers(userList []U, userIdList []string, alterIdList 
 			userAlterIds[user] = alterIds
 		}
 	}
-	s.userKey = userKeyMap
-	s.userIdCipher = userIdCipherMap
+	s.publishUsers(userKeyMap, userIdCipherMap)
 	s.alterIds = userAlterIds
 	s.alterIdUpdateTime = make(map[U]int64)
 	s.generateLegacyKeys()
@@ -170,6 +197,66 @@ func (s *Service[U]) generateLegacyKeys() {
 	s.alterIdMap = userAlterIdMap
 }
 
+// publishUsers installs new credentials. Users that are still present and not
+// idle keep their place in hot, with the cipher re-derived from the new table
+// and lastAccess carried over. A promotion that races with this store is
+// lost, which only means that user is promoted again on its next cold hit.
+func (s *Service[U]) publishUsers(key map[U][16]byte, idCipher map[U]cipher.Block) {
+	var hot []authEntry[U]
+	if current := s.users.Load(); current != nil {
+		now := s.time().Unix()
+		hot = make([]authEntry[U], 0, len(current.hot))
+		for i := range current.hot {
+			entry := &current.hot[i]
+			currentCipher, loaded := idCipher[entry.user]
+			if !loaded {
+				continue
+			}
+			lastAccess := atomic.LoadInt64(&entry.lastAccess)
+			if now-lastAccess > authHotIdleSeconds {
+				continue
+			}
+			hot = append(hot, authEntry[U]{user: entry.user, cipher: currentCipher, lastAccess: lastAccess})
+		}
+	}
+	cold := make([]authEntry[U], 0, len(idCipher))
+	for user, userIdCipher := range idCipher {
+		cold = append(cold, authEntry[U]{user: user, cipher: userIdCipher})
+	}
+	s.users.Store(&userTable[U]{key: key, idCipher: idCipher, hot: hot, cold: cold})
+}
+
+// promoteUser moves a user that just passed the cold scan into hot. It builds
+// the next snapshot from the current one and swaps it in with a single
+// compare-and-swap; if another promotion or an UpdateUsers landed first the
+// attempt is simply dropped and the user is promoted on its next cold hit, so
+// a cold hit never blocks or spins. Idle entries are demoted here rather than
+// on the read path.
+func (s *Service[U]) promoteUser(user U, now int64) {
+	current := s.users.Load()
+	if current == nil {
+		return
+	}
+	userIdCipher, loaded := current.idCipher[user]
+	if !loaded {
+		return
+	}
+	hot := make([]authEntry[U], 0, len(current.hot)+1)
+	for i := range current.hot {
+		entry := &current.hot[i]
+		if entry.user == user {
+			return
+		}
+		lastAccess := atomic.LoadInt64(&entry.lastAccess)
+		if now-lastAccess > authHotIdleSeconds {
+			continue
+		}
+		hot = append(hot, authEntry[U]{user: entry.user, cipher: entry.cipher, lastAccess: lastAccess})
+	}
+	hot = append(hot, authEntry[U]{user: user, cipher: userIdCipher, lastAccess: now})
+	s.users.CompareAndSwap(current, &userTable[U]{key: current.key, idCipher: current.idCipher, hot: hot, cold: current.cold})
+}
+
 func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.Socksaddr, onClose N.CloseHandlerFunc) error {
 	const headerLenBufferLen = 2 + CipherOverhead
 	const aeadMinHeaderLen = 16 + headerLenBufferLen + 8 + CipherOverhead + 42
@@ -203,49 +290,46 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 
 	var timestamp int64
 	now := s.time().Unix()
+	// One snapshot of the credential tables serves the whole handshake.
+	users := s.users.Load()
+	if users == nil {
+		users = &userTable[U]{}
+	}
 
-	// Hot path: try recently active users first
-	s.recentUsers.Range(func(key, value any) bool {
-		cachedUser, _ := key.(U)
-		userIdBlock, exists := s.userIdCipher[cachedUser]
-		if !exists {
-			s.recentUsers.Delete(cachedUser)
-			return true
+	// Hot path: users that authenticated recently, in one contiguous slice, so
+	// a probe is one AES block decrypt plus a CRC per entry with no map lookups.
+	for i := range users.hot {
+		entry := &users.hot[i]
+		entry.cipher.Decrypt(decodedId[:], authId)
+		if crc32.ChecksumIEEE(decodedId[:12]) != binary.BigEndian.Uint32(decodedId[12:]) {
+			continue
 		}
-		lastAccessPtr, _ := value.(*int64)
-		userIdBlock.Decrypt(decodedId[:], authId)
-		timestamp = int64(binary.BigEndian.Uint64(decodedId[:]))
-		checksum := binary.BigEndian.Uint32(decodedId[12:])
-		if crc32.ChecksumIEEE(decodedId[:12]) != checksum {
-			if now-*lastAccessPtr > 600 {
-				s.recentUsers.Delete(cachedUser)
-			}
-			return true
+		// A user opening many connections in the same second would otherwise
+		// write the same cache line from every core.
+		if atomic.LoadInt64(&entry.lastAccess) != now {
+			atomic.StoreInt64(&entry.lastAccess, now)
 		}
-		user = cachedUser
+		user = entry.user
 		found = true
-		*lastAccessPtr = now
-		return false
-	})
+		break
+	}
 
-	// Cold path: iterate through all users if not found in cache
+	// Cold path: every user, then promote the match into hot.
 	if !found {
-		for currUser, userIdBlock := range s.userIdCipher {
-			userIdBlock.Decrypt(decodedId[:], authId)
-			timestamp = int64(binary.BigEndian.Uint64(decodedId[:]))
-			checksum := binary.BigEndian.Uint32(decodedId[12:])
-			if crc32.ChecksumIEEE(decodedId[:12]) != checksum {
+		for i := range users.cold {
+			entry := &users.cold[i]
+			entry.cipher.Decrypt(decodedId[:], authId)
+			if crc32.ChecksumIEEE(decodedId[:12]) != binary.BigEndian.Uint32(decodedId[12:]) {
 				continue
 			}
-			user = currUser
+			user = entry.user
 			found = true
-			// Add to recent users cache
-			s.recentUsers.Store(currUser, &now)
+			s.promoteUser(entry.user, now)
 			break
 		}
 	}
-
 	if found {
+		timestamp = int64(binary.BigEndian.Uint64(decodedId[:]))
 		if math.Abs(math.Abs(float64(timestamp))-float64(now)) > 120 {
 			return ErrBadTimestamp
 		}
@@ -270,7 +354,7 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 	}
 
 	ctx = auth.ContextWithUser(ctx, user)
-	cmdKey := s.userKey[user]
+	cmdKey := users.key[user]
 	var headerReader io.Reader
 	var headerBuffer []byte
 
@@ -285,8 +369,7 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 		common.Must(binary.Write(timeHash, binary.BigEndian, legacyTimestamp))
 		common.Must(binary.Write(timeHash, binary.BigEndian, legacyTimestamp))
 		common.Must(binary.Write(timeHash, binary.BigEndian, legacyTimestamp))
-		userKey := s.userKey[user]
-		headerReader = NewStreamReader(reader, userKey[:], timeHash.Sum(nil))
+		headerReader = NewStreamReader(reader, cmdKey[:], timeHash.Sum(nil))
 		headerBuffer = make([]byte, 38)
 		_, err = io.ReadFull(headerReader, headerBuffer)
 		if err != nil {

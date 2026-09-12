@@ -94,7 +94,11 @@ const authHotIdleSeconds = 600
 
 func NewService[U comparable](handler Handler, options ...ServiceOption) *Service[U] {
 	service := &Service[U]{
-		replayFilter: replay.NewSimple(time.Second * 120),
+		// The timestamp check below accepts a whole-second offset of up to 120,
+		// so a captured authID stays acceptable for slightly more than 240s of
+		// wall time. Remembering it for less than that leaves a window in which
+		// the filter has forgotten the authID while the timestamp still passes.
+		replayFilter: replay.NewSimple(time.Second * 241),
 		handler:      handler,
 		time:         time.Now,
 	}

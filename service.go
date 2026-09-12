@@ -337,7 +337,10 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 		if math.Abs(math.Abs(float64(timestamp))-float64(now)) > 120 {
 			return ErrBadTimestamp
 		}
-		if !s.replayFilter.Check(decodedId[:]) {
+		// Keyed on the authID as it appeared on the wire, like the reference
+		// implementation: the decrypted form is the same for two users whose
+		// clocks and random bytes happen to coincide.
+		if !s.replayFilter.Check(authId) {
 			return ErrReplay
 		}
 	}

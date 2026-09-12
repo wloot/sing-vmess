@@ -21,6 +21,10 @@ type chunkBufferReader interface {
 // reads that ask for less than a chunk keep the rest for the next call, like
 // bufio.ChunkReader, but a read that can take a whole chunk goes straight to
 // the chain and nothing is kept around for the life of the connection.
+//
+// There is deliberately no Close: the connection may be closed from another
+// goroutine while the reader is handing its leftover out, so the leftover is
+// left to the garbage collector rather than returned to the pool.
 type chunkReader struct {
 	upstream chunkBufferReader
 	extended N.ExtendedReader
@@ -112,14 +116,6 @@ func (r *chunkReader) WaitReadBuffer() (*buf.Buffer, error) {
 	relayout.Write(buffer.Bytes())
 	buffer.Release()
 	return relayout, nil
-}
-
-func (r *chunkReader) Close() error {
-	if r.cache != nil {
-		r.cache.Release()
-		r.cache = nil
-	}
-	return nil
 }
 
 var _ N.ReadWaiter = (*chunkReader)(nil)

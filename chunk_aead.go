@@ -114,6 +114,10 @@ func (w *AEADWriter) Write(p []byte) (n int, err error) {
 }
 
 func (w *AEADWriter) WriteBuffer(buffer *buf.Buffer) error {
+	if buffer.IsEmpty() {
+		buffer.Release()
+		return nil
+	}
 	w.seal(buffer)
 	return w.upstream.WriteBuffer(buffer)
 }

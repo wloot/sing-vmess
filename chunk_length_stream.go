@@ -21,6 +21,7 @@ type StreamChunkReader struct {
 	upstream      io.Reader
 	chunkMasking  sha3.ShakeHash
 	globalPadding sha3.ShakeHash
+	header        [2]byte
 }
 
 func NewStreamChunkReader(upstream io.Reader, chunkMasking sha3.ShakeHash, globalPadding sha3.ShakeHash) *StreamChunkReader {
@@ -31,13 +32,14 @@ func NewStreamChunkReader(upstream io.Reader, chunkMasking sha3.ShakeHash, globa
 	}
 }
 
-func (r *StreamChunkReader) Read(p []byte) (n int, err error) {
-	var length uint16
-	err = binary.Read(r.upstream, binary.BigEndian, &length)
+// readLength reads the length prefix of the next chunk and returns the payload
+// and padding lengths it describes; a payload length of zero ends the stream.
+func (r *StreamChunkReader) readLength() (dataLen int, paddingLen int, err error) {
+	_, err = io.ReadFull(r.upstream, r.header[:])
 	if err != nil {
 		return
 	}
-	var paddingLen int
+	length := binary.BigEndian.Uint16(r.header[:])
 	if r.globalPadding != nil {
 		var hashCode uint16
 		common.Must(binary.Read(r.globalPadding, binary.BigEndian, &hashCode))
@@ -48,12 +50,16 @@ func (r *StreamChunkReader) Read(p []byte) (n int, err error) {
 		common.Must(binary.Read(r.chunkMasking, binary.BigEndian, &hashCode))
 		length ^= hashCode
 	}
-	dataLen := int(length)
-	if paddingLen > 0 {
-		dataLen -= paddingLen
-	}
+	dataLen = int(length) - paddingLen
 	if dataLen < 0 {
 		err = E.Extend(ErrBadLengthChunk, "length=", length, ", padding=", paddingLen)
+	}
+	return
+}
+
+func (r *StreamChunkReader) Read(p []byte) (n int, err error) {
+	dataLen, paddingLen, err := r.readLength()
+	if err != nil {
 		return
 	}
 	if dataLen == 0 {
@@ -73,6 +79,29 @@ func (r *StreamChunkReader) Read(p []byte) (n int, err error) {
 	}
 	_, err = io.CopyN(io.Discard, r.upstream, int64(paddingLen))
 	return
+}
+
+// readChunk reads the next chunk into a buffer of its own, allocated once the
+// length prefix says how much is coming, with the headroom the relay asked for.
+func (r *StreamChunkReader) readChunk(frontHeadroom int, rearHeadroom int) (*buf.Buffer, error) {
+	dataLen, paddingLen, err := r.readLength()
+	if err != nil {
+		return nil, err
+	}
+	if dataLen == 0 {
+		return nil, io.EOF
+	}
+	buffer := buf.NewSize(frontHeadroom + dataLen + rearHeadroom)
+	buffer.Resize(frontHeadroom, 0)
+	_, err = buffer.ReadFullFrom(r.upstream, dataLen)
+	if err == nil && paddingLen > 0 {
+		_, err = io.CopyN(io.Discard, r.upstream, int64(paddingLen))
+	}
+	if err != nil {
+		buffer.Release()
+		return nil, err
+	}
+	return buffer, nil
 }
 
 func (r *StreamChunkReader) Upstream() any {

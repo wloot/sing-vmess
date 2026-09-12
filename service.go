@@ -471,7 +471,7 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 	}
 	reader = CreateReader(reader, nil, requestBodyKey, requestBodyNonce, requestBodyKey, requestBodyNonce, security, option)
 	if option&RequestOptionChunkStream != 0 && command == CommandTCP || command == CommandMux {
-		reader = bufio.NewChunkReader(reader, ReadChunkSize)
+		reader = newChunkReader(reader)
 	}
 	rawConn := rawServerConn{
 		Conn:           conn,
@@ -704,6 +704,16 @@ type serverConn struct {
 
 func (c *serverConn) Read(b []byte) (n int, err error) {
 	return c.reader.Read(b)
+}
+
+var _ N.ReadWaitCreator = (*serverConn)(nil)
+
+// CreateReadWaiter lets the relay take chunks straight from the chunk stream
+// reader, which allocates each one only once its length has arrived, instead
+// of parking a pooled buffer on the connection while it waits.
+func (c *serverConn) CreateReadWaiter() (N.ReadWaiter, bool) {
+	waiter, isWaiter := c.reader.(N.ReadWaiter)
+	return waiter, isWaiter
 }
 
 func (c *serverConn) Write(b []byte) (n int, err error) {

@@ -22,6 +22,7 @@ type AEADChunkReader struct {
 	globalPadding sha3.ShakeHash
 	nonce         []byte
 	nonceCount    uint16
+	header        [2 + CipherOverhead]byte
 }
 
 func NewAEADChunkReader(upstream io.Reader, cipher cipher.AEAD, nonce []byte, globalPadding sha3.ShakeHash) *AEADChunkReader {
@@ -43,24 +44,23 @@ func NewChacha20Poly1305ChunkReader(upstream io.Reader, key []byte, nonce []byte
 	return NewAEADChunkReader(upstream, newChacha20Poly1305(GenerateChacha20Poly1305Key(KDF(key, "auth_len")[:16])), nonce, globalPadding)
 }
 
-func (r *AEADChunkReader) Read(p []byte) (n int, err error) {
-	if cap(p) < 2+CipherOverhead {
-		return 0, E.Extend(io.ErrShortBuffer, "AEAD chunk need ", 2+CipherOverhead)
-	}
-	_, err = io.ReadFull(r.upstream, p[:2+CipherOverhead])
+// readLength reads and opens the length prefix of the next chunk and returns
+// the ciphertext and padding lengths it describes; a length of zero ends the
+// stream.
+func (r *AEADChunkReader) readLength() (dataLen int, paddingLen int, err error) {
+	_, err = io.ReadFull(r.upstream, r.header[:])
 	if err != nil {
 		return
 	}
 	binary.BigEndian.PutUint16(r.nonce, r.nonceCount)
 	r.nonceCount += 1
-	_, err = r.cipher.Open(p[:0], r.nonce, p[:2+CipherOverhead], nil)
+	_, err = r.cipher.Open(r.header[:0], r.nonce, r.header[:], nil)
 	if err != nil {
 		return
 	}
-	length := binary.BigEndian.Uint16(p[:2])
+	length := binary.BigEndian.Uint16(r.header[:2])
 	length += CipherOverhead
-	dataLen := int(length)
-	var paddingLen int
+	dataLen = int(length)
 	if r.globalPadding != nil {
 		var hashCode uint16
 		common.Must(binary.Read(r.globalPadding, binary.BigEndian, &hashCode))
@@ -69,6 +69,13 @@ func (r *AEADChunkReader) Read(p []byte) (n int, err error) {
 	}
 	if dataLen < 0 {
 		err = E.Extend(ErrBadLengthChunk, "length=", length, ", padding=", paddingLen)
+	}
+	return
+}
+
+func (r *AEADChunkReader) Read(p []byte) (n int, err error) {
+	dataLen, paddingLen, err := r.readLength()
+	if err != nil {
 		return
 	}
 	if dataLen == 0 {
@@ -88,6 +95,29 @@ func (r *AEADChunkReader) Read(p []byte) (n int, err error) {
 	}
 	_, err = io.CopyN(io.Discard, r.upstream, int64(paddingLen))
 	return
+}
+
+// readChunk reads the next chunk into a buffer of its own, allocated once the
+// length prefix says how much is coming, with the headroom the relay asked for.
+func (r *AEADChunkReader) readChunk(frontHeadroom int, rearHeadroom int) (*buf.Buffer, error) {
+	dataLen, paddingLen, err := r.readLength()
+	if err != nil {
+		return nil, err
+	}
+	if dataLen == 0 {
+		return nil, io.EOF
+	}
+	buffer := buf.NewSize(frontHeadroom + dataLen + rearHeadroom)
+	buffer.Resize(frontHeadroom, 0)
+	_, err = buffer.ReadFullFrom(r.upstream, dataLen)
+	if err == nil && paddingLen > 0 {
+		_, err = io.CopyN(io.Discard, r.upstream, int64(paddingLen))
+	}
+	if err != nil {
+		buffer.Release()
+		return nil, err
+	}
+	return buffer, nil
 }
 
 func (r *AEADChunkReader) Upstream() any {

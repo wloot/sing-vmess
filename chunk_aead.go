@@ -12,6 +12,7 @@ import (
 
 type AEADReader struct {
 	upstream   N.ExtendedReader
+	chunks     chunkBufferReader // upstream again, when it can hand out whole chunks
 	cipher     cipher.AEAD
 	nonce      []byte
 	nonceCount uint16
@@ -20,8 +21,10 @@ type AEADReader struct {
 func NewAEADReader(upstream io.Reader, cipher cipher.AEAD, nonce []byte) *AEADReader {
 	readNonce := make([]byte, cipher.NonceSize())
 	copy(readNonce, nonce)
+	chunks, _ := upstream.(chunkBufferReader)
 	return &AEADReader{
 		upstream: bufio.NewExtendedReader(upstream),
+		chunks:   chunks,
 		cipher:   cipher,
 		nonce:    readNonce,
 	}
@@ -63,6 +66,23 @@ func (r *AEADReader) ReadBuffer(buffer *buf.Buffer) error {
 	}
 	buffer.Truncate(buffer.Len() - CipherOverhead)
 	return nil
+}
+
+// readChunk takes the next chunk from the length layer and opens it in place.
+func (r *AEADReader) readChunk(frontHeadroom int, rearHeadroom int) (*buf.Buffer, error) {
+	buffer, err := r.chunks.readChunk(frontHeadroom, rearHeadroom)
+	if err != nil {
+		return nil, err
+	}
+	binary.BigEndian.PutUint16(r.nonce, r.nonceCount)
+	r.nonceCount += 1
+	_, err = r.cipher.Open(buffer.Index(0), r.nonce, buffer.Bytes(), nil)
+	if err != nil {
+		buffer.Release()
+		return nil, err
+	}
+	buffer.Truncate(buffer.Len() - CipherOverhead)
+	return buffer, nil
 }
 
 func (r *AEADReader) Upstream() any {

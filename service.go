@@ -437,6 +437,11 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 	default:
 		return E.New("unknown command: ", command)
 	}
+	switch security {
+	case SecurityTypeLegacy, SecurityTypeAes128Gcm, SecurityTypeChacha20Poly1305, SecurityTypeNone:
+	default:
+		return E.Extend(ErrUnsupportedSecurityType, security)
+	}
 	if command == CommandUDP && option == 0 {
 		return E.New("bad packet connection")
 	}
